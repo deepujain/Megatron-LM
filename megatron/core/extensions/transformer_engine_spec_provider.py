@@ -17,7 +17,13 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    VocabParallelCrossEntropy,
+    fused_vocab_parallel_cross_entropy,
+    require,
+    vocab_parallel_cross_entropy,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
@@ -35,6 +41,17 @@ class _TENormWithResidual:
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    #: Checked once, while the provider is built. This is what replaces the
+    #: ``if not HAVE_TE: raise ImportError(...)`` that each spec builder used to carry.
+    REQUIRES = "transformer_engine"
+
+    def __init__(
+        self, use_te_op_fuser: bool = False, cross_entropy_loss_fusion: bool = False
+    ) -> None:
+        require(self.REQUIRES)
+        self._use_te_op_fuser = use_te_op_fuser
+        self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -112,3 +129,34 @@ class TESpecProvider(BackendSpecProvider):
         # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
+
+    def mlp_module(self, grouped: bool = False) -> type:
+        """The dense MLP block, fused into TE operations when the fuser is on."""
+        if not self._use_te_op_fuser:
+            from megatron.core.transformer.mlp import MLP
+
+            return MLP
+        from megatron.core.extensions.transformer_engine import (
+            TEFusedMLP,
+            TEFusedMLPWithGroupedLinear,
+        )
+
+        target = TEFusedMLPWithGroupedLinear if grouped else TEFusedMLP
+        if target is None:
+            raise ImportError(
+                "Transformer Engine is installed but does not expose the operation-fused MLP."
+            )
+        return target
+
+    def moe_router(self) -> Optional[type]:
+        """Keep the MoESubmodules default."""
+        return None
+
+    def vocab_parallel_cross_entropy(self) -> VocabParallelCrossEntropy:
+        """Which vocab-parallel cross entropy to use.
+
+        Deliberately never TE's: megatron/training/arguments.py disables it for stability.
+        """
+        if self._cross_entropy_loss_fusion:
+            return fused_vocab_parallel_cross_entropy
+        return vocab_parallel_cross_entropy
